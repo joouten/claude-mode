@@ -1,0 +1,19 @@
+{
+  "name": "claude-mode",
+  "version": "1.0.0",
+  "description": "Slash command system bridging Claude Chat and Claude Code. Eliminates context loss when switching between thinking and execution modes.",
+  "bin": {
+    "claude-mode": "./bin/init.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "workflow",
+    "context",
+    "handoff",
+    "slash-commands"
+  ],
+  "author": "joouten",
+  "license": "MIT"
+}

@@ -1,0 +1,4 @@
+# claude-mode generated files — do not commit
+/CHAT_TO_CODE.md
+/CODE_TO_CHAT.md
+node_modules/
