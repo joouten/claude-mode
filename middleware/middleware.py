@@ -45,6 +45,9 @@ DEFAULT_AGENTAPI_PORT = 3284
 FLASK_PORT_TRIES = 3
 AGENTAPI_READY_TIMEOUT = 30          # seconds
 AGENTAPI_POLL_INTERVAL = 0.5
+AGENTAPI_DELIVERY_TIMEOUT = 60       # seconds — POST /message socket timeout
+AGENTAPI_DELIVERY_MAX_RETRIES = 3
+AGENTAPI_DELIVERY_RETRY_WAIT = 5     # seconds between delivery retries on timeout
 DELIVERY_STABLE_TIMEOUT = 30
 ACTIVITY_LOG_SIZE = 10
 DEBOUNCE_SECONDS = 2.0
@@ -223,14 +226,35 @@ def wait_for_agentapi(port: int, timeout: float = AGENTAPI_READY_TIMEOUT) -> boo
     return False
 
 
-def deliver_to_code(content: str, port: int) -> tuple[bool, str]:
-    """POST content to AgentAPI /message, then poll /status until stable."""
+def deliver_to_code(content: str, port: int, state: "State") -> tuple[bool, str]:
+    """POST content to AgentAPI /message, then poll /status until stable.
+
+    The POST is retried on requests.Timeout up to AGENTAPI_DELIVERY_MAX_RETRIES
+    times with AGENTAPI_DELIVERY_RETRY_WAIT seconds between attempts. Other
+    request exceptions (connection refused, etc.) fail fast — same shape as
+    the 529 retry on the Messages API path.
+    """
     url = f"http://127.0.0.1:{port}/message"
-    try:
-        r = requests.post(url, json={"content": content, "type": "user"}, timeout=10)
-        r.raise_for_status()
-    except requests.RequestException as exc:
-        return False, f"POST /message failed: {exc}"
+    payload = {"content": content, "type": "user"}
+
+    for attempt in range(AGENTAPI_DELIVERY_MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=AGENTAPI_DELIVERY_TIMEOUT)
+            r.raise_for_status()
+            break  # success — proceed to status poll
+        except requests.Timeout:
+            if attempt >= AGENTAPI_DELIVERY_MAX_RETRIES:
+                return False, (
+                    f"POST /message timed out after {AGENTAPI_DELIVERY_MAX_RETRIES} retries "
+                    f"({AGENTAPI_DELIVERY_TIMEOUT}s each)"
+                )
+            state.log(
+                f"Delivery retry {attempt + 1}/{AGENTAPI_DELIVERY_MAX_RETRIES} after "
+                f"{AGENTAPI_DELIVERY_RETRY_WAIT}s — AgentAPI POST timeout"
+            )
+            time.sleep(AGENTAPI_DELIVERY_RETRY_WAIT)
+        except requests.RequestException as exc:
+            return False, f"POST /message failed: {exc}"
 
     status_url = f"http://127.0.0.1:{port}/status"
     deadline = time.time() + DELIVERY_STABLE_TIMEOUT
@@ -441,7 +465,7 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
             f"{state.project_path / CHAT_TO_CODE} and execute it per "
             f"/project:mode-cc instructions."
         )
-        ok, msg = deliver_to_code(content=message, port=state.agentapi_port)
+        ok, msg = deliver_to_code(content=message, port=state.agentapi_port, state=state)
         if not ok:
             state.set_status("error")
             state.log(f"Delivery failed: {msg}")
