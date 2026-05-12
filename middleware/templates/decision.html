@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>claude-mode middleware — decision ready</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --fg: #1a1a1a;
+      --bg: #fafafa;
+      --muted: #6a6a6a;
+      --border: #d0d0d0;
+      --ok-bg: #2a7a2a;
+      --ok-fg: #ffffff;
+      --bad-bg: #a02020;
+      --bad-fg: #ffffff;
+      --pre-bg: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --fg:#e6e6e6; --bg:#1a1a1a; --muted:#9a9a9a; --border:#3a3a3a; --pre-bg:#0f0f0f; }
+    }
+    body { font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--fg); background: var(--bg); margin: 2rem auto; max-width: 980px; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; letter-spacing: 0.05em; }
+    pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-wrap: break-word; }
+    .actions { display: flex; gap: 0.75rem; margin: 1rem 0; }
+    button { font: inherit; padding: 0.6rem 1.4rem; border: 0; border-radius: 6px; cursor: pointer; letter-spacing: 0.05em; }
+    .approve { background: var(--ok-bg); color: var(--ok-fg); }
+    .reject  { background: var(--bad-bg); color: var(--bad-fg); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #reject-form { display: none; margin-top: 1rem; }
+    #reject-form textarea { width: 100%; min-height: 6rem; font: inherit; padding: 0.5rem; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; background: var(--pre-bg); color: var(--fg); }
+    p.muted { color: var(--muted); margin: 0 0 1rem; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <h1>DECISION READY FOR REVIEW</h1>
+  <p class="muted">Reviewing <strong>{{ project_path }}/CHAT_TO_CODE.md</strong>. Approve to deliver to Claude Code, or reject with feedback to revise.</p>
+
+  <pre>{{ decision }}</pre>
+
+  <div class="actions">
+    <form method="post" action="/approve" style="display:inline">
+      <button type="submit" class="approve">APPROVE</button>
+    </form>
+    <button type="button" class="reject" onclick="document.getElementById('reject-form').style.display='block';this.disabled=true;">REJECT</button>
+  </div>
+
+  <form id="reject-form" method="post" action="/reject">
+    <label for="feedback">Feedback for Chat (what to change):</label>
+    <textarea id="feedback" name="feedback" required placeholder="e.g. The NEXT ACTION is too vague — specify exact filenames and line numbers."></textarea>
+    <div class="actions">
+      <button type="submit" class="reject">SUBMIT REJECTION</button>
+    </div>
+  </form>
+
+  <p class="muted"><a href="/">&larr; Back to status</a></p>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="3">
+  <title>claude-mode middleware — status</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --fg: #1a1a1a;
+      --bg: #fafafa;
+      --muted: #6a6a6a;
+      --border: #d0d0d0;
+      --ok: #2a7a2a;
+      --warn: #b06a00;
+      --bad: #a02020;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --fg:#e6e6e6; --bg:#1a1a1a; --muted:#9a9a9a; --border:#3a3a3a; }
+    }
+    body { font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--fg); background: var(--bg); margin: 2rem auto; max-width: 880px; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; letter-spacing: 0.05em; }
+    .card { border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    .field { display: grid; grid-template-columns: 12rem 1fr; gap: 0.5rem; margin: 0.25rem 0; }
+    .field b { color: var(--muted); font-weight: 500; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    ul.log { list-style: none; padding: 0; margin: 0; }
+    ul.log li { padding: 0.25rem 0; border-bottom: 1px dotted var(--border); }
+    ul.log li:last-child { border-bottom: 0; }
+    .ts { color: var(--muted); margin-right: 0.5rem; }
+    footer { color: var(--muted); font-size: 0.85em; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>CLAUDE-MODE MIDDLEWARE</h1>
+
+  <div class="card">
+    <div class="field"><b>Status</b><span class="{% if state.status == 'watching' %}ok{% elif state.status == 'awaiting_approval' %}warn{% else %}ok{% endif %}">{{ state.status }}</span></div>
+    <div class="field"><b>Project</b><span>{{ state.project_path }}</span></div>
+    <div class="field"><b>AgentAPI</b><span class="{% if state.agentapi_running %}ok{% else %}bad{% endif %}">{% if state.agentapi_running %}running (port {{ state.agentapi_port }}){% else %}stopped{% endif %}</span></div>
+    <div class="field"><b>Web UI</b><span>http://localhost:{{ state.flask_port }}</span></div>
+    <div class="field"><b>Last event</b><span>{{ state.last_event or '—' }}</span></div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:1rem;margin:0 0 0.5rem;color:var(--muted);">Recent activity</h2>
+    {% if state.activity_log %}
+      <ul class="log">
+        {% for entry in state.activity_log %}
+          <li><span class="ts">{{ entry.timestamp }}</span>{{ entry.message }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p style="color:var(--muted);margin:0;">No events yet.</p>
+    {% endif %}
+  </div>
+
+  {% if state.status == 'awaiting_approval' %}
+    <div class="card">
+      <p>A decision is ready for User review. <a href="/decision">Review now &rarr;</a></p>
+    </div>
+  {% endif %}
+
+  <footer>Auto-refreshes every 3 seconds.</footer>
+</body>
+</html>
