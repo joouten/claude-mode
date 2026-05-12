@@ -34,8 +34,13 @@
   </style>
 </head>
 <body>
-  <h1>DECISION READY FOR REVIEW</h1>
-  <p class="muted">Reviewing <strong>{{ project_path }}/CHAT_TO_CODE.md</strong>. Approve to deliver to Claude Code, or reject with feedback to revise.</p>
+  {% if flow == "B" %}
+    <h1>CHAT_TO_CODE.md READY FOR DELIVERY</h1>
+    <p class="muted">Chat-initiated session. Review the brief below from <strong>{{ project_path }}/CHAT_TO_CODE.md</strong>. Approve to deliver to Claude Code, or dismiss to discard (no Chat revision — edit the file and re-save to retry).</p>
+  {% else %}
+    <h1>DECISION READY FOR REVIEW</h1>
+    <p class="muted">Reviewing <strong>{{ project_path }}/CHAT_TO_CODE.md</strong>. Approve to deliver to Claude Code, or reject with feedback to revise.</p>
+  {% endif %}
 
   <pre>{{ decision }}</pre>
 
@@ -43,16 +48,24 @@
     <form method="post" action="/approve" style="display:inline">
       <button type="submit" class="approve">APPROVE</button>
     </form>
-    <button type="button" class="reject" onclick="document.getElementById('reject-form').style.display='block';this.disabled=true;">REJECT</button>
+    {% if flow == "B" %}
+      <form method="post" action="/reject" style="display:inline">
+        <button type="submit" class="reject">DISMISS</button>
+      </form>
+    {% else %}
+      <button type="button" class="reject" onclick="document.getElementById('reject-form').style.display='block';this.disabled=true;">REJECT</button>
+    {% endif %}
   </div>
 
-  <form id="reject-form" method="post" action="/reject">
-    <label for="feedback">Feedback for Chat (what to change):</label>
-    <textarea id="feedback" name="feedback" required placeholder="e.g. The NEXT ACTION is too vague — specify exact filenames and line numbers."></textarea>
-    <div class="actions">
-      <button type="submit" class="reject">SUBMIT REJECTION</button>
-    </div>
-  </form>
+  {% if flow != "B" %}
+    <form id="reject-form" method="post" action="/reject">
+      <label for="feedback">Feedback for Chat (what to change):</label>
+      <textarea id="feedback" name="feedback" required placeholder="e.g. The NEXT ACTION is too vague — specify exact filenames and line numbers."></textarea>
+      <div class="actions">
+        <button type="submit" class="reject">SUBMIT REJECTION</button>
+      </div>
+    </form>
+  {% endif %}
 
   <p class="muted"><a href="/">&larr; Back to status</a></p>
 </body>

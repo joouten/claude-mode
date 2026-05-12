@@ -113,6 +113,11 @@ class State:
     #   starting | watching | processing | awaiting_approval |
     #   delivering | executing | error
     status: str = "starting"
+    # pending_flow values:
+    #   None         - no active flow (status == 'watching' or 'starting')
+    #   "A"          - Flow A: Code escalation -> Chat -> approval -> SDK delivery
+    #   "B"          - Flow B: Chat-initiated -> approval -> SDK delivery (no Chat call)
+    pending_flow: Optional[str] = None
     last_event: str = ""
     activity_log: deque = field(default_factory=lambda: deque(maxlen=ACTIVITY_LOG_SIZE))
     pending_decision: str = ""
@@ -135,6 +140,7 @@ class State:
                 "project_path": str(self.project_path),
                 "flask_port": self.flask_port,
                 "status": self.status,
+                "pending_flow": self.pending_flow,
                 "last_event": self.last_event,
                 "activity_log": list(self.activity_log),
             }
@@ -296,10 +302,16 @@ def deliver_to_code(project_path: Path, state: "State") -> None:
                     pass
 
             asyncio.run(_consume())
+            with state._lock:
+                state.pending_flow = None
             state.set_status("watching")
-            state.log("Code execution complete — watching for CODE_TO_CHAT.md")
+            state.log(
+                f"Code execution complete — watching for {CODE_TO_CHAT} or {CHAT_TO_CODE}"
+            )
         except Exception as exc:
             logging.exception("Agent SDK delivery failed")
+            # pending_flow intentionally retained on error so the status page
+            # still shows which flow was being executed when it failed.
             state.set_status("error")
             state.log(f"Agent SDK error: {type(exc).__name__}: {exc}")
 
@@ -309,45 +321,66 @@ def deliver_to_code(project_path: Path, state: "State") -> None:
 # ---------- watchdog handler ----------
 
 class HandoffHandler(FileSystemEventHandler):
-    """Watches the project dir for CODE_TO_CHAT.md changes.
+    """Watches the project dir for CODE_TO_CHAT.md and CHAT_TO_CODE.md changes.
 
-    Uses a threading.Timer-based debounce: every watchdog event for the target
-    file cancels any pending timer and starts a fresh one with DEBOUNCE_SECONDS
-    delay. The handoff only fires when DEBOUNCE_SECONDS elapse with no new
-    events, guaranteeing one API call per save regardless of how many create /
-    modify events the filesystem emits per save (File Explorer commonly emits
-    2-3 events; some editors emit even more).
+    Two flows depending on which file changed:
+      Flow A — CODE_TO_CHAT.md: Code escalation. Read the file, call Chat
+               (Messages API) for a decision, write the response to
+               CHAT_TO_CODE.md, await User approval, then SDK delivery.
+      Flow B — CHAT_TO_CODE.md: Chat-initiated session. The brief is already
+               on disk; skip the Chat call and go straight to User approval,
+               then SDK delivery.
+
+    Debounce
+      Each tracked filename has its own threading.Timer. Events for one
+      filename only cancel/reset that filename's timer — concurrent events
+      for the two files do not interfere with each other.
+
+    Flow B suppression rule
+      Flow B fires only when state.status == 'watching'. This is critical
+      because Flow A writes CHAT_TO_CODE.md to disk as part of its work,
+      which would otherwise re-trigger the watchdog and start a recursive
+      Flow B for the brief we just generated. Other transient states
+      (processing, awaiting_approval, delivering, executing, error) likewise
+      block Flow B — the system is busy with something else, the User can
+      retrigger by re-saving once back to 'watching'.
     """
+
+    TARGET_FILES = (CODE_TO_CHAT, CHAT_TO_CODE)
 
     def __init__(self, state: State, client: Anthropic, template: str):
         super().__init__()
         self.state = state
         self.client = client
         self.template = template
-        self._debounce_timer: Optional[threading.Timer] = None
+        # Per-filename debounce timers — events for one file do not cancel
+        # the other's pending timer.
+        self._debounce_timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
 
     def _is_target(self, src_path: str) -> bool:
-        return Path(src_path).name == CODE_TO_CHAT
+        return Path(src_path).name in self.TARGET_FILES
 
     def _schedule_handoff(self, src_path: str) -> None:
-        """Cancel any pending timer and arm a fresh one. The handoff fires
-        when the timer elapses without being canceled by another event."""
+        """Cancel any pending timer FOR THIS FILENAME and arm a fresh one.
+        Other filenames' timers are untouched."""
+        filename = Path(src_path).name
         with self._lock:
-            if self._debounce_timer is not None:
-                self._debounce_timer.cancel()
+            existing = self._debounce_timers.get(filename)
+            if existing is not None:
+                existing.cancel()
             timer = threading.Timer(DEBOUNCE_SECONDS, self._process, args=(src_path,))
             timer.daemon = True
-            self._debounce_timer = timer
+            self._debounce_timers[filename] = timer
             timer.start()
 
     def cancel_pending(self) -> None:
-        """Cancel any pending debounce timer. Called from shutdown so the
-        handler does not fire mid-shutdown."""
+        """Cancel any pending debounce timer (across all tracked files).
+        Called from shutdown so handlers do not fire mid-shutdown."""
         with self._lock:
-            if self._debounce_timer is not None:
-                self._debounce_timer.cancel()
-                self._debounce_timer = None
+            for timer in self._debounce_timers.values():
+                timer.cancel()
+            self._debounce_timers.clear()
 
     def on_created(self, event):
         if event.is_directory:
@@ -362,29 +395,69 @@ class HandoffHandler(FileSystemEventHandler):
             self._schedule_handoff(event.src_path)
 
     def _process(self, src_path: str) -> None:
+        filename = Path(src_path).name
         try:
-            self.state.set_status("processing")
-            self.state.log(f"Detected {CODE_TO_CHAT} change — calling Chat")
-            content = Path(src_path).read_text(encoding="utf-8")
-            response = call_chat(
-                self.client, self.state, content, self.state.project_path, self.template
-            )
-            target = self.state.project_path / CHAT_TO_CODE
-            target.write_text(response, encoding="utf-8")
-            with self.state._lock:
-                self.state.pending_decision = response
-            self.state.set_status("awaiting_approval")
-            self.state.log(f"Decision written to {CHAT_TO_CODE} — awaiting User approval")
-            try:
-                opened = webbrowser.open(f"http://127.0.0.1:{self.state.flask_port}/decision")
-                if not opened:
-                    self.state.log("webbrowser.open returned False — open the URL manually")
-            except Exception as exc:
-                self.state.log(f"webbrowser.open failed: {exc}")
+            if filename == CODE_TO_CHAT:
+                self._process_flow_a(src_path)
+            elif filename == CHAT_TO_CODE:
+                # Flow B suppression: only treat as a Chat-initiated session
+                # when the system is idle. Otherwise this event is most
+                # likely the file we just wrote ourselves (Flow A processing,
+                # /reject revise, etc.) or a User edit while a prior brief
+                # is still pending.
+                current = self.state.snapshot()["status"]
+                if current != "watching":
+                    logging.info(
+                        "Flow B suppressed: %s changed but status is %r (not 'watching')",
+                        filename, current,
+                    )
+                    return
+                self._process_flow_b(src_path)
         except Exception as exc:
-            logging.exception("Handoff processing failed")
+            logging.exception("Handoff processing failed (file=%s)", filename)
             self.state.set_status("error")
             self.state.log(f"Error during handoff: {exc}")
+
+    def _process_flow_a(self, src_path: str) -> None:
+        """Flow A: Code escalation. CODE_TO_CHAT.md was written by Code;
+        call Chat for a decision, write the response to CHAT_TO_CODE.md,
+        await User approval at /decision."""
+        self.state.set_status("processing")
+        self.state.log(f"Detected {CODE_TO_CHAT} change — calling Chat (Flow A)")
+        content = Path(src_path).read_text(encoding="utf-8")
+        response = call_chat(
+            self.client, self.state, content, self.state.project_path, self.template
+        )
+        target = self.state.project_path / CHAT_TO_CODE
+        target.write_text(response, encoding="utf-8")
+        with self.state._lock:
+            self.state.pending_decision = response
+            self.state.pending_flow = "A"
+        self.state.set_status("awaiting_approval")
+        self.state.log(f"Decision written to {CHAT_TO_CODE} — awaiting User approval (Flow A)")
+        self._open_decision_browser()
+
+    def _process_flow_b(self, src_path: str) -> None:
+        """Flow B: Chat-initiated session. CHAT_TO_CODE.md was written
+        directly by Chat (or the User dropped one in). No Messages API
+        call needed — Chat already made the decision. Load the brief
+        and await User approval at /decision."""
+        self.state.log(f"Detected {CHAT_TO_CODE} change — Chat-initiated session (Flow B)")
+        content = Path(src_path).read_text(encoding="utf-8")
+        with self.state._lock:
+            self.state.pending_decision = content
+            self.state.pending_flow = "B"
+        self.state.set_status("awaiting_approval")
+        self.state.log(f"Brief loaded from {CHAT_TO_CODE} — awaiting User approval (Flow B)")
+        self._open_decision_browser()
+
+    def _open_decision_browser(self) -> None:
+        try:
+            opened = webbrowser.open(f"http://127.0.0.1:{self.state.flask_port}/decision")
+            if not opened:
+                self.state.log("webbrowser.open returned False — open the URL manually")
+        except Exception as exc:
+            self.state.log(f"webbrowser.open failed: {exc}")
 
 
 # ---------- Flask app ----------
@@ -406,6 +479,7 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
             "decision.html",
             decision=state.pending_decision,
             project_path=snap["project_path"],
+            flow=snap["pending_flow"],
         )
 
     @app.route("/approve", methods=["POST"])
@@ -432,11 +506,25 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
         snap = state.snapshot()
         if snap["status"] != "awaiting_approval":
             return redirect(url_for("index"))
+
+        # Flow B reject: dismiss the brief and return to watching. No Chat
+        # revision (per the brief — User edits CHAT_TO_CODE.md and re-drops
+        # to retry). Feedback from the form is intentionally discarded for
+        # Flow B; the same form is reused for both flows for UI simplicity.
+        if snap["pending_flow"] == "B":
+            with state._lock:
+                state.pending_decision = ""
+                state.pending_flow = None
+            state.set_status("watching")
+            state.log("Flow B brief dismissed — back to watching")
+            return redirect(url_for("index"))
+
+        # Flow A reject: existing revise-via-Chat path.
         feedback = request.form.get("feedback", "").strip()
         if not feedback:
             return redirect(url_for("decision"))
         state.set_status("processing")
-        state.log("User rejected — asking Chat to revise")
+        state.log("User rejected — asking Chat to revise (Flow A)")
         try:
             revised = _create_with_retry(
                 client,
@@ -534,7 +622,7 @@ def main() -> int:
     observer = Observer()
     observer.schedule(handler, str(project_path), recursive=False)
     observer.start()
-    state.log(f"Watching {project_path} for {CODE_TO_CHAT}")
+    state.log(f"Watching {project_path} for {CODE_TO_CHAT} or {CHAT_TO_CODE}")
 
     # Flask in a daemon thread
     app = build_flask_app(state, client, template)

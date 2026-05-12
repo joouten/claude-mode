@@ -41,6 +41,9 @@
   <div class="card">
     <div class="field"><b>Status</b><span class="{% if state.status == 'watching' %}ok{% elif state.status == 'executing' or state.status == 'delivering' or state.status == 'processing' %}busy{% elif state.status == 'awaiting_approval' %}warn{% elif state.status == 'error' %}bad{% else %}ok{% endif %}">{% if state.status == 'executing' %}executing (Code is running…){% else %}{{ state.status }}{% endif %}</span></div>
     <div class="field"><b>Project</b><span>{{ state.project_path }}</span></div>
+    {% if state.pending_flow %}
+    <div class="field"><b>Flow</b><span>{% if state.pending_flow == 'A' %}Code escalation → Chat{% elif state.pending_flow == 'B' %}Chat initiated → Code{% else %}{{ state.pending_flow }}{% endif %}</span></div>
+    {% endif %}
     <div class="field"><b>Web UI</b><span>http://localhost:{{ state.flask_port }}</span></div>
     <div class="field"><b>Last event</b><span>{{ state.last_event or '—' }}</span></div>
   </div>
