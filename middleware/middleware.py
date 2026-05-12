@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from flask import Flask, redirect, render_template, request, url_for
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -47,7 +47,9 @@ AGENTAPI_READY_TIMEOUT = 30          # seconds
 AGENTAPI_POLL_INTERVAL = 0.5
 DELIVERY_STABLE_TIMEOUT = 30
 ACTIVITY_LOG_SIZE = 10
-DEBOUNCE_SECONDS = 1.0
+DEBOUNCE_SECONDS = 2.0
+MAX_RETRIES = 5
+BACKOFF_SCHEDULE = (2, 4, 8, 16, 32)  # seconds before retries 1..5 on 529
 CHAT_TO_CODE = "CHAT_TO_CODE.md"
 CODE_TO_CHAT = "CODE_TO_CHAT.md"
 CLAUDE_MD = "CLAUDE.md"
@@ -266,8 +268,37 @@ def _extract_text(content_blocks) -> str:
     return "".join(parts).strip()
 
 
+def _create_with_retry(client: Anthropic, state: "State", **kwargs):
+    """Call `client.messages.create(**kwargs)` with exponential backoff on 529.
+
+    Retries up to MAX_RETRIES times with the BACKOFF_SCHEDULE waits between
+    attempts. Other APIStatusError codes (auth 4xx, non-529 5xx) and other
+    exceptions re-raise immediately. After exhausting retries, raises
+    RuntimeError so the caller's `Error during handoff:` path fires with a
+    clear message instructing User how to retry the loop.
+    """
+    last_exc: Optional[APIStatusError] = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except APIStatusError as exc:
+            if exc.status_code != 529:
+                raise
+            last_exc = exc
+            if attempt >= MAX_RETRIES:
+                break
+            wait_s = BACKOFF_SCHEDULE[attempt]
+            state.log(f"Retry {attempt + 1}/{MAX_RETRIES} after {wait_s}s — API overloaded")
+            time.sleep(wait_s)
+    raise RuntimeError(
+        f"API overloaded after {MAX_RETRIES} retries — "
+        "drop CODE_TO_CHAT.md again to retry the loop"
+    ) from last_exc
+
+
 def call_chat(
     client: Anthropic,
+    state: "State",
     code_to_chat_content: str,
     project_path: Path,
     template: str,
@@ -285,7 +316,9 @@ def call_chat(
         claude_md=claude_md_content,
     )
 
-    resp = client.messages.create(
+    resp = _create_with_retry(
+        client,
+        state,
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=system,
@@ -297,43 +330,66 @@ def call_chat(
 # ---------- watchdog handler ----------
 
 class HandoffHandler(FileSystemEventHandler):
+    """Watches the project dir for CODE_TO_CHAT.md changes.
+
+    Uses a threading.Timer-based debounce: every watchdog event for the target
+    file cancels any pending timer and starts a fresh one with DEBOUNCE_SECONDS
+    delay. The handoff only fires when DEBOUNCE_SECONDS elapse with no new
+    events, guaranteeing one API call per save regardless of how many create /
+    modify events the filesystem emits per save (File Explorer commonly emits
+    2-3 events; some editors emit even more).
+    """
+
     def __init__(self, state: State, client: Anthropic, template: str):
         super().__init__()
         self.state = state
         self.client = client
         self.template = template
-        self._last_fire = 0.0
+        self._debounce_timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
 
     def _is_target(self, src_path: str) -> bool:
         return Path(src_path).name == CODE_TO_CHAT
 
-    def _maybe_process(self, src_path: str) -> None:
-        if not self._is_target(src_path):
-            return
+    def _schedule_handoff(self, src_path: str) -> None:
+        """Cancel any pending timer and arm a fresh one. The handoff fires
+        when the timer elapses without being canceled by another event."""
         with self._lock:
-            now = time.time()
-            if now - self._last_fire < DEBOUNCE_SECONDS:
-                return
-            self._last_fire = now
-        threading.Thread(target=self._process, args=(src_path,), daemon=True).start()
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+            timer = threading.Timer(DEBOUNCE_SECONDS, self._process, args=(src_path,))
+            timer.daemon = True
+            self._debounce_timer = timer
+            timer.start()
+
+    def cancel_pending(self) -> None:
+        """Cancel any pending debounce timer. Called from shutdown so the
+        handler does not fire mid-shutdown."""
+        with self._lock:
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
 
     def on_created(self, event):
         if event.is_directory:
             return
-        self._maybe_process(event.src_path)
+        if self._is_target(event.src_path):
+            self._schedule_handoff(event.src_path)
 
     def on_modified(self, event):
         if event.is_directory:
             return
-        self._maybe_process(event.src_path)
+        if self._is_target(event.src_path):
+            self._schedule_handoff(event.src_path)
 
     def _process(self, src_path: str) -> None:
         try:
             self.state.set_status("processing")
             self.state.log(f"Detected {CODE_TO_CHAT} change — calling Chat")
             content = Path(src_path).read_text(encoding="utf-8")
-            response = call_chat(self.client, content, self.state.project_path, self.template)
+            response = call_chat(
+                self.client, self.state, content, self.state.project_path, self.template
+            )
             target = self.state.project_path / CHAT_TO_CODE
             target.write_text(response, encoding="utf-8")
             with self.state._lock:
@@ -407,7 +463,9 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
         state.set_status("processing")
         state.log("User rejected — asking Chat to revise")
         try:
-            revised = client.messages.create(
+            revised = _create_with_retry(
+                client,
+                state,
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT.format(
@@ -578,6 +636,10 @@ def main() -> int:
             shutdown_event.wait(timeout=1.0)
     finally:
         state.log("Shutting down")
+        try:
+            handler.cancel_pending()  # cancel any pending debounce timer
+        except Exception:
+            pass
         try:
             observer.stop()
             observer.join(timeout=5)
