@@ -48,7 +48,7 @@ AGENTAPI_POLL_INTERVAL = 0.5
 AGENTAPI_DELIVERY_TIMEOUT = 60       # seconds — POST /message socket timeout
 AGENTAPI_DELIVERY_MAX_RETRIES = 3
 AGENTAPI_DELIVERY_RETRY_WAIT = 5     # seconds between delivery retries on timeout
-AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT = 30   # wait for 'stable' before POST /message
+AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT = 120  # wait for 'stable' before POST /message
 DELIVERY_STABLE_TIMEOUT = 30                # wait for 'stable' after POST /message
 ACTIVITY_LOG_SIZE = 10
 DEBOUNCE_SECONDS = 2.0
@@ -359,7 +359,7 @@ def wait_for_agentapi(port: int, timeout: float = AGENTAPI_READY_TIMEOUT) -> boo
     return False
 
 
-def _poll_until_stable(port: int, timeout: float) -> bool:
+def _poll_until_stable(port: int, timeout: float, label: str = "poll") -> bool:
     """Poll AgentAPI GET /status until the JSON `status` field equals 'stable'.
 
     AgentAPI's HTTP server starts responding on /status as soon as the process
@@ -368,21 +368,67 @@ def _poll_until_stable(port: int, timeout: float) -> bool:
     Code is idle and ready to accept the next user message.
 
     Returns True on success, False on timeout.
+
+    Diagnostic logging
+      Every poll logs one INFO line with attempt number, HTTP status, and the
+      parsed status field (or a short hint about why it could not be parsed).
+      A separate INFO line is emitted once each time the status string
+      changes, with the full response body — so a session log shows the
+      AgentAPI state progression compactly while preserving the full
+      response at transition points for forensics.
     """
     status_url = f"http://127.0.0.1:{port}/status"
     deadline = time.time() + timeout
+    started = time.time()
+    attempt = 0
+    last_status_value: Optional[str] = None
+
     while time.time() < deadline:
+        attempt += 1
+        elapsed = time.time() - started
         try:
             r = requests.get(status_url, timeout=2)
+            body_preview = (r.text or "")[:500].replace("\n", " ")
+            status_value: Optional[str] = None
+            parse_note = ""
             if r.status_code == 200:
                 try:
-                    if r.json().get("status") == "stable":
-                        return True
+                    status_value = r.json().get("status")
                 except ValueError:
-                    pass
-        except requests.RequestException:
-            pass
+                    parse_note = " (non-JSON body)"
+            else:
+                parse_note = f" (HTTP {r.status_code})"
+
+            logging.info(
+                "_poll_until_stable[%s] #%d t=%.1fs HTTP=%d status=%r%s",
+                label, attempt, elapsed, r.status_code,
+                status_value, parse_note,
+            )
+            if status_value != last_status_value:
+                logging.info(
+                    "_poll_until_stable[%s] status transition: %r -> %r; body=%s",
+                    label, last_status_value, status_value, body_preview,
+                )
+                last_status_value = status_value
+
+            if status_value == "stable":
+                logging.info(
+                    "_poll_until_stable[%s] reached 'stable' after %.1fs / %d polls",
+                    label, elapsed, attempt,
+                )
+                return True
+        except requests.RequestException as exc:
+            logging.info(
+                "_poll_until_stable[%s] #%d t=%.1fs request error: %s: %s",
+                label, attempt, elapsed, type(exc).__name__, exc,
+            )
+
         time.sleep(AGENTAPI_POLL_INTERVAL)
+
+    logging.warning(
+        "_poll_until_stable[%s] TIMEOUT after %.1fs / %d polls; last status=%r",
+        label, time.time() - started, attempt, last_status_value,
+    )
     return False
 
 
@@ -400,22 +446,48 @@ def deliver_to_code(content: str, port: int, state: "State") -> tuple[bool, str]
          message before the status page flips back to 'watching'.
     """
     state.log("Waiting for AgentAPI 'stable' before delivery")
-    if not _poll_until_stable(port, AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT):
+    logging.info(
+        "deliver_to_code: starting pre-delivery stable poll "
+        "(timeout=%ds, port=%d)",
+        AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT, port,
+    )
+    if not _poll_until_stable(
+        port, AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT, label="pre-delivery"
+    ):
         return False, (
             f"AgentAPI did not reach 'stable' within "
             f"{AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT}s — Code may be stuck at "
-            "a permission prompt or still initializing"
+            "a permission prompt or still initializing (see _poll_until_stable "
+            "log entries for the per-poll status progression)"
         )
 
     url = f"http://127.0.0.1:{port}/message"
     payload = {"content": content, "type": "user"}
+    payload_bytes = len(content.encode("utf-8"))
 
     for attempt in range(AGENTAPI_DELIVERY_MAX_RETRIES + 1):
+        logging.info(
+            "POST %s attempt %d/%d: payload=%d bytes, socket timeout=%ds",
+            url, attempt + 1, AGENTAPI_DELIVERY_MAX_RETRIES + 1,
+            payload_bytes, AGENTAPI_DELIVERY_TIMEOUT,
+        )
+        post_started = time.time()
         try:
             r = requests.post(url, json=payload, timeout=AGENTAPI_DELIVERY_TIMEOUT)
+            post_elapsed = time.time() - post_started
+            body_preview = (r.text or "")[:500].replace("\n", " ")
+            logging.info(
+                "POST %s attempt %d: HTTP %d in %.2fs; body=%s",
+                url, attempt + 1, r.status_code, post_elapsed, body_preview,
+            )
             r.raise_for_status()
             break  # success — proceed to post-delivery stable poll
-        except requests.Timeout:
+        except requests.Timeout as exc:
+            post_elapsed = time.time() - post_started
+            logging.warning(
+                "POST %s attempt %d: TIMEOUT after %.2fs (no response received): %s",
+                url, attempt + 1, post_elapsed, exc,
+            )
             if attempt >= AGENTAPI_DELIVERY_MAX_RETRIES:
                 return False, (
                     f"POST /message timed out after {AGENTAPI_DELIVERY_MAX_RETRIES} retries "
@@ -426,10 +498,22 @@ def deliver_to_code(content: str, port: int, state: "State") -> tuple[bool, str]
                 f"{AGENTAPI_DELIVERY_RETRY_WAIT}s — AgentAPI POST timeout"
             )
             time.sleep(AGENTAPI_DELIVERY_RETRY_WAIT)
+        except requests.HTTPError as exc:
+            # Server returned a non-2xx; body was already logged above.
+            return False, (
+                f"POST /message returned HTTP {exc.response.status_code}: "
+                f"{(exc.response.text or '')[:300]}"
+            )
         except requests.RequestException as exc:
-            return False, f"POST /message failed: {exc}"
+            post_elapsed = time.time() - post_started
+            logging.warning(
+                "POST %s attempt %d: %s after %.2fs: %s",
+                url, attempt + 1, type(exc).__name__, post_elapsed, exc,
+            )
+            return False, f"POST /message failed: {type(exc).__name__}: {exc}"
 
-    if _poll_until_stable(port, DELIVERY_STABLE_TIMEOUT):
+    logging.info("deliver_to_code: starting post-delivery stable poll")
+    if _poll_until_stable(port, DELIVERY_STABLE_TIMEOUT, label="post-delivery"):
         return True, "delivered (stable)"
     return True, "delivered (status did not reach stable within timeout)"
 
