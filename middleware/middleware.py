@@ -43,7 +43,7 @@ MAX_TOKENS = 4096
 DEFAULT_FLASK_PORT = 5000
 DEFAULT_AGENTAPI_PORT = 3284
 FLASK_PORT_TRIES = 3
-AGENTAPI_READY_TIMEOUT = 30          # seconds
+AGENTAPI_READY_TIMEOUT = 60          # seconds — wait for /status to respond
 AGENTAPI_POLL_INTERVAL = 0.5
 AGENTAPI_DELIVERY_TIMEOUT = 60       # seconds — POST /message socket timeout
 AGENTAPI_DELIVERY_MAX_RETRIES = 3
@@ -163,6 +163,123 @@ def find_free_port(start: int, tries: int = FLASK_PORT_TRIES) -> Optional[int]:
         if port_available(candidate):
             return candidate
     return None
+
+
+def find_pid_on_port(port: int) -> Optional[int]:
+    """Find PID of the process listening on TCP `port`, or None.
+
+    Cross-platform via subprocess: `netstat -ano` on Windows, `lsof` on Unix.
+    No new Python dependency. Returns None if no listener is found, if the
+    platform tool is unavailable, or if parsing fails.
+    """
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                # Proto  Local Address  Foreign Address  State        PID
+                if len(parts) < 5 or parts[0] != "TCP":
+                    continue
+                if parts[3] != "LISTENING":
+                    continue
+                # Local is like "127.0.0.1:3284" or "0.0.0.0:3284" or "[::]:3284"
+                if not parts[1].endswith(f":{port}"):
+                    continue
+                try:
+                    return int(parts[4])
+                except ValueError:
+                    continue
+            return None
+        # Unix: lsof prints just PIDs with -t
+        result = subprocess.run(
+            ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+        return int(lines[0]) if lines else None
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def get_process_name(pid: int) -> str:
+    """Best-effort process-name lookup. Returns '' on any failure."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+            # CSV: "name.exe","pid","Console","1","mem"
+            if line.startswith('"'):
+                return line.split('","', 1)[0].strip('"')
+            return ""
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return result.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, IndexError):
+        return ""
+
+
+def kill_pid(pid: int) -> bool:
+    """Forcefully terminate `pid`. Cross-platform: taskkill /F on Windows,
+    SIGKILL on Unix. Returns True on success (or if the process is already
+    gone), False if the kill could not be issued."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            # 0 = killed, 128 = process not found (already gone — count as success)
+            return result.returncode in (0, 128)
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except (subprocess.SubprocessError, ProcessLookupError, OSError):
+        return False
+
+
+def free_port_or_kill_stale(port: int) -> None:
+    """If `port` is in use, identify the holder and forcefully kill it so
+    AgentAPI can bind cleanly on startup. Raises SystemExit via fatal() if
+    the holder cannot be identified, killed, or the port does not free up
+    afterward — those cases should not be silently auto-recovered."""
+    if port_available(port):
+        return
+    pid = find_pid_on_port(port)
+    if pid is None:
+        fatal(
+            f"Port {port} is in use but the holding process could not be "
+            "identified (netstat/lsof returned no match). Stop it manually "
+            f"or pass --agentapi-port <N>."
+        )
+    name = get_process_name(pid) or "(unknown)"
+    logging.warning(
+        "Port %d is held by PID %d (%s) — killing it (auto-recovery from stale AgentAPI)",
+        port, pid, name,
+    )
+    if not kill_pid(pid):
+        fatal(
+            f"Failed to kill PID {pid} ({name}) on port {port}. "
+            "Run `taskkill /F /PID {pid}` (Windows) or `kill -9 {pid}` (Unix) manually."
+        )
+    # Wait for the socket to drain. Killed LISTENING sockets release fast,
+    # but give the OS a small window before re-checking.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if port_available(port):
+            logging.info("Port %d is now free (killed PID %d)", port, pid)
+            return
+        time.sleep(0.5)
+    fatal(
+        f"Killed PID {pid} but port {port} did not free up within 5s. "
+        "Another listener may be present — investigate manually."
+    )
 
 
 # ---------- agentapi subprocess ----------
@@ -623,12 +740,10 @@ def main() -> int:
     if flask_port != args.port:
         logging.info("Flask fell back from port %s to %s", args.port, flask_port)
 
-    # agentapi port (no fallback — brief says flag to User if busy)
-    if not port_available(args.agentapi_port):
-        fatal(
-            f"AgentAPI port {args.agentapi_port} is in use. "
-            "Stop the conflicting process or pass --agentapi-port <N>."
-        )
+    # agentapi port — if a stale AgentAPI (or any other listener) is holding
+    # it, kill it automatically so the next startup is not blocked. fatal()
+    # is raised inside the helper if the PID cannot be identified or killed.
+    free_port_or_kill_stale(args.agentapi_port)
 
     state = State(
         project_path=project_path,
