@@ -1,25 +1,29 @@
 """
-claude-mode middleware — Phase 3 automation bridge.
+claude-mode middleware — Phase 3 automation bridge (Claude Agent SDK).
 
-Wires Claude Chat (Anthropic Messages API) to Claude Code (AgentAPI persistent
-HTTP server) with a Flask web UI for User approval and a watchdog file watcher
-that drives the full Chat <-> Code loop automatically.
+Wires Claude Chat (Anthropic Messages API) to Claude Code (Claude Agent SDK)
+with a Flask web UI for User approval and a watchdog file watcher that drives
+the full Chat <-> Code loop automatically.
+
+Each delivery starts a fresh Claude Code session via the Agent SDK's `query()`
+in a daemon thread — CHAT_TO_CODE.md carries all the context Code needs, and
+project CLAUDE.md is loaded automatically via setting_sources=["project"].
+The watchdog continues watching the project dir during execution, so if Code
+writes CODE_TO_CHAT.md the next loop iteration starts automatically.
 
 Usage:
-    python middleware.py --project C:\\path\\to\\project [--port 5000] [--agentapi-port 3284]
+    python middleware.py --project C:\\path\\to\\project [--port 5000]
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
+import asyncio
 import logging
 import os
 import re
-import shutil
 import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -30,7 +34,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import requests
 from anthropic import Anthropic, APIStatusError
 from flask import Flask, redirect, render_template, request, url_for
 from watchdog.events import FileSystemEventHandler
@@ -41,15 +44,7 @@ from watchdog.observers import Observer
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 DEFAULT_FLASK_PORT = 5000
-DEFAULT_AGENTAPI_PORT = 3284
 FLASK_PORT_TRIES = 3
-AGENTAPI_READY_TIMEOUT = 60          # seconds — wait for /status to respond
-AGENTAPI_POLL_INTERVAL = 0.5
-AGENTAPI_DELIVERY_TIMEOUT = 60       # seconds — POST /message socket timeout
-AGENTAPI_DELIVERY_MAX_RETRIES = 3
-AGENTAPI_DELIVERY_RETRY_WAIT = 5     # seconds between delivery retries on timeout
-AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT = 120  # wait for 'stable' before POST /message
-DELIVERY_STABLE_TIMEOUT = 30                # wait for 'stable' after POST /message
 ACTIVITY_LOG_SIZE = 10
 DEBOUNCE_SECONDS = 2.0
 MAX_RETRIES = 5
@@ -114,9 +109,10 @@ def load_dotenv(path: Path) -> dict:
 class State:
     project_path: Path
     flask_port: int = DEFAULT_FLASK_PORT
-    agentapi_port: int = DEFAULT_AGENTAPI_PORT
-    status: str = "starting"          # starting | watching | processing | awaiting_approval | delivering | error
-    agentapi_running: bool = False
+    # status values:
+    #   starting | watching | processing | awaiting_approval |
+    #   delivering | executing | error
+    status: str = "starting"
     last_event: str = ""
     activity_log: deque = field(default_factory=lambda: deque(maxlen=ACTIVITY_LOG_SIZE))
     pending_decision: str = ""
@@ -138,15 +134,13 @@ class State:
             return {
                 "project_path": str(self.project_path),
                 "flask_port": self.flask_port,
-                "agentapi_port": self.agentapi_port,
                 "status": self.status,
-                "agentapi_running": self.agentapi_running,
                 "last_event": self.last_event,
                 "activity_log": list(self.activity_log),
             }
 
 
-# ---------- port utilities ----------
+# ---------- port utilities (Flask only — Agent SDK has no port footprint) ----------
 
 def port_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -165,360 +159,7 @@ def find_free_port(start: int, tries: int = FLASK_PORT_TRIES) -> Optional[int]:
     return None
 
 
-def find_pid_on_port(port: int) -> Optional[int]:
-    """Find PID of the process listening on TCP `port`, or None.
-
-    Cross-platform via subprocess: `netstat -ano` on Windows, `lsof` on Unix.
-    No new Python dependency. Returns None if no listener is found, if the
-    platform tool is unavailable, or if parsing fails.
-    """
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                # Proto  Local Address  Foreign Address  State        PID
-                if len(parts) < 5 or parts[0] != "TCP":
-                    continue
-                if parts[3] != "LISTENING":
-                    continue
-                # Local is like "127.0.0.1:3284" or "0.0.0.0:3284" or "[::]:3284"
-                if not parts[1].endswith(f":{port}"):
-                    continue
-                try:
-                    return int(parts[4])
-                except ValueError:
-                    continue
-            return None
-        # Unix: lsof prints just PIDs with -t
-        result = subprocess.run(
-            ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
-        return int(lines[0]) if lines else None
-    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
-        return None
-
-
-def get_process_name(pid: int) -> str:
-    """Best-effort process-name lookup. Returns '' on any failure."""
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-            # CSV: "name.exe","pid","Console","1","mem"
-            if line.startswith('"'):
-                return line.split('","', 1)[0].strip('"')
-            return ""
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "comm="],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        return result.stdout.strip()
-    except (subprocess.SubprocessError, FileNotFoundError, OSError, IndexError):
-        return ""
-
-
-def kill_pid(pid: int) -> bool:
-    """Forcefully terminate `pid`. Cross-platform: taskkill /F on Windows,
-    SIGKILL on Unix. Returns True on success (or if the process is already
-    gone), False if the kill could not be issued."""
-    try:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            # 0 = killed, 128 = process not found (already gone — count as success)
-            return result.returncode in (0, 128)
-        os.kill(pid, signal.SIGKILL)
-        return True
-    except (subprocess.SubprocessError, ProcessLookupError, OSError):
-        return False
-
-
-def free_port_or_kill_stale(port: int) -> None:
-    """If `port` is in use, identify the holder and forcefully kill it so
-    AgentAPI can bind cleanly on startup. Raises SystemExit via fatal() if
-    the holder cannot be identified, killed, or the port does not free up
-    afterward — those cases should not be silently auto-recovered."""
-    if port_available(port):
-        return
-    pid = find_pid_on_port(port)
-    if pid is None:
-        fatal(
-            f"Port {port} is in use but the holding process could not be "
-            "identified (netstat/lsof returned no match). Stop it manually "
-            f"or pass --agentapi-port <N>."
-        )
-    name = get_process_name(pid) or "(unknown)"
-    logging.warning(
-        "Port %d is held by PID %d (%s) — killing it (auto-recovery from stale AgentAPI)",
-        port, pid, name,
-    )
-    if not kill_pid(pid):
-        fatal(
-            f"Failed to kill PID {pid} ({name}) on port {port}. "
-            "Run `taskkill /F /PID {pid}` (Windows) or `kill -9 {pid}` (Unix) manually."
-        )
-    # Wait for the socket to drain. Killed LISTENING sockets release fast,
-    # but give the OS a small window before re-checking.
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        if port_available(port):
-            logging.info("Port %d is now free (killed PID %d)", port, pid)
-            return
-        time.sleep(0.5)
-    fatal(
-        f"Killed PID {pid} but port {port} did not free up within 5s. "
-        "Another listener may be present — investigate manually."
-    )
-
-
-# ---------- agentapi subprocess ----------
-
-_agentapi_proc: Optional[subprocess.Popen] = None
-
-
-def find_agentapi() -> Optional[str]:
-    return shutil.which("agentapi")
-
-
-def launch_agentapi() -> subprocess.Popen:
-    """Launch AgentAPI wrapping Claude Code on the default port 3284.
-
-    The wrapped `claude` runs with --dangerously-skip-permissions so that:
-      - the workspace-trust dialog at startup does not block 'stable',
-      - per-tool permission prompts mid-loop do not block AgentAPI delivery.
-
-    SECURITY NOTE: this means Code will execute the approved CHAT_TO_CODE.md
-    brief end-to-end without further confirmation. The User-approval gate
-    in this architecture is the /decision web UI, not Code's tool prompts —
-    the brief is the unit of consent. Run this middleware only against
-    projects you trust.
-
-    The --agentapi-port CLI arg controls only what port we connect TO, not
-    what port AgentAPI binds to (AgentAPI's default 3284 is used).
-    """
-    global _agentapi_proc
-    cmd = [
-        "agentapi", "server", "--type=claude", "--",
-        "claude", "--dangerously-skip-permissions",
-    ]
-    logging.info("Launching: %s", " ".join(cmd))
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        creationflags=creationflags,
-    )
-    _agentapi_proc = proc
-    atexit.register(terminate_agentapi)
-    return proc
-
-
-def terminate_agentapi() -> None:
-    global _agentapi_proc
-    if _agentapi_proc is None:
-        return
-    if _agentapi_proc.poll() is not None:
-        _agentapi_proc = None
-        return
-    try:
-        if os.name == "nt":
-            _agentapi_proc.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            _agentapi_proc.terminate()
-        _agentapi_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        _agentapi_proc.kill()
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.warning("agentapi shutdown error: %s", exc)
-    _agentapi_proc = None
-
-
-def wait_for_agentapi(port: int, timeout: float = AGENTAPI_READY_TIMEOUT) -> bool:
-    deadline = time.time() + timeout
-    url = f"http://127.0.0.1:{port}/status"
-    while time.time() < deadline:
-        try:
-            r = requests.get(url, timeout=2)
-            if r.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(AGENTAPI_POLL_INTERVAL)
-    return False
-
-
-def _poll_until_stable(port: int, timeout: float, label: str = "poll") -> bool:
-    """Poll AgentAPI GET /status until the JSON `status` field equals 'stable'.
-
-    AgentAPI's HTTP server starts responding on /status as soon as the process
-    is up, but the wrapped Claude Code inside may still be initializing
-    (workspace-trust dialog, agent boot, etc.). 'stable' is the signal that
-    Code is idle and ready to accept the next user message.
-
-    Returns True on success, False on timeout.
-
-    Diagnostic logging
-      Every poll logs one INFO line with attempt number, HTTP status, and the
-      parsed status field (or a short hint about why it could not be parsed).
-      A separate INFO line is emitted once each time the status string
-      changes, with the full response body — so a session log shows the
-      AgentAPI state progression compactly while preserving the full
-      response at transition points for forensics.
-    """
-    status_url = f"http://127.0.0.1:{port}/status"
-    deadline = time.time() + timeout
-    started = time.time()
-    attempt = 0
-    last_status_value: Optional[str] = None
-
-    while time.time() < deadline:
-        attempt += 1
-        elapsed = time.time() - started
-        try:
-            r = requests.get(status_url, timeout=2)
-            body_preview = (r.text or "")[:500].replace("\n", " ")
-            status_value: Optional[str] = None
-            parse_note = ""
-            if r.status_code == 200:
-                try:
-                    status_value = r.json().get("status")
-                except ValueError:
-                    parse_note = " (non-JSON body)"
-            else:
-                parse_note = f" (HTTP {r.status_code})"
-
-            logging.info(
-                "_poll_until_stable[%s] #%d t=%.1fs HTTP=%d status=%r%s",
-                label, attempt, elapsed, r.status_code,
-                status_value, parse_note,
-            )
-            if status_value != last_status_value:
-                logging.info(
-                    "_poll_until_stable[%s] status transition: %r -> %r; body=%s",
-                    label, last_status_value, status_value, body_preview,
-                )
-                last_status_value = status_value
-
-            if status_value == "stable":
-                logging.info(
-                    "_poll_until_stable[%s] reached 'stable' after %.1fs / %d polls",
-                    label, elapsed, attempt,
-                )
-                return True
-        except requests.RequestException as exc:
-            logging.info(
-                "_poll_until_stable[%s] #%d t=%.1fs request error: %s: %s",
-                label, attempt, elapsed, type(exc).__name__, exc,
-            )
-
-        time.sleep(AGENTAPI_POLL_INTERVAL)
-
-    logging.warning(
-        "_poll_until_stable[%s] TIMEOUT after %.1fs / %d polls; last status=%r",
-        label, time.time() - started, attempt, last_status_value,
-    )
-    return False
-
-
-def deliver_to_code(content: str, port: int, state: "State") -> tuple[bool, str]:
-    """Deliver `content` to Claude Code via AgentAPI.
-
-    Sequence:
-      1. Wait for AgentAPI to reach 'stable' before POSTing — POSTing while
-         Code is still booting (or stuck at a permission prompt) hangs past
-         the socket timeout. Pre-delivery timeout: AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT.
-      2. POST /message, retrying on requests.Timeout up to
-         AGENTAPI_DELIVERY_MAX_RETRIES times with AGENTAPI_DELIVERY_RETRY_WAIT
-         seconds between attempts. Other request exceptions fail fast.
-      3. Wait again for 'stable' so the caller knows Code has processed the
-         message before the status page flips back to 'watching'.
-    """
-    state.log("Waiting for AgentAPI 'stable' before delivery")
-    logging.info(
-        "deliver_to_code: starting pre-delivery stable poll "
-        "(timeout=%ds, port=%d)",
-        AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT, port,
-    )
-    if not _poll_until_stable(
-        port, AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT, label="pre-delivery"
-    ):
-        return False, (
-            f"AgentAPI did not reach 'stable' within "
-            f"{AGENTAPI_PRE_DELIVERY_STABLE_TIMEOUT}s — Code may be stuck at "
-            "a permission prompt or still initializing (see _poll_until_stable "
-            "log entries for the per-poll status progression)"
-        )
-
-    url = f"http://127.0.0.1:{port}/message"
-    payload = {"content": content, "type": "user"}
-    payload_bytes = len(content.encode("utf-8"))
-
-    for attempt in range(AGENTAPI_DELIVERY_MAX_RETRIES + 1):
-        logging.info(
-            "POST %s attempt %d/%d: payload=%d bytes, socket timeout=%ds",
-            url, attempt + 1, AGENTAPI_DELIVERY_MAX_RETRIES + 1,
-            payload_bytes, AGENTAPI_DELIVERY_TIMEOUT,
-        )
-        post_started = time.time()
-        try:
-            r = requests.post(url, json=payload, timeout=AGENTAPI_DELIVERY_TIMEOUT)
-            post_elapsed = time.time() - post_started
-            body_preview = (r.text or "")[:500].replace("\n", " ")
-            logging.info(
-                "POST %s attempt %d: HTTP %d in %.2fs; body=%s",
-                url, attempt + 1, r.status_code, post_elapsed, body_preview,
-            )
-            r.raise_for_status()
-            break  # success — proceed to post-delivery stable poll
-        except requests.Timeout as exc:
-            post_elapsed = time.time() - post_started
-            logging.warning(
-                "POST %s attempt %d: TIMEOUT after %.2fs (no response received): %s",
-                url, attempt + 1, post_elapsed, exc,
-            )
-            if attempt >= AGENTAPI_DELIVERY_MAX_RETRIES:
-                return False, (
-                    f"POST /message timed out after {AGENTAPI_DELIVERY_MAX_RETRIES} retries "
-                    f"({AGENTAPI_DELIVERY_TIMEOUT}s each)"
-                )
-            state.log(
-                f"Delivery retry {attempt + 1}/{AGENTAPI_DELIVERY_MAX_RETRIES} after "
-                f"{AGENTAPI_DELIVERY_RETRY_WAIT}s — AgentAPI POST timeout"
-            )
-            time.sleep(AGENTAPI_DELIVERY_RETRY_WAIT)
-        except requests.HTTPError as exc:
-            # Server returned a non-2xx; body was already logged above.
-            return False, (
-                f"POST /message returned HTTP {exc.response.status_code}: "
-                f"{(exc.response.text or '')[:300]}"
-            )
-        except requests.RequestException as exc:
-            post_elapsed = time.time() - post_started
-            logging.warning(
-                "POST %s attempt %d: %s after %.2fs: %s",
-                url, attempt + 1, type(exc).__name__, post_elapsed, exc,
-            )
-            return False, f"POST /message failed: {type(exc).__name__}: {exc}"
-
-    logging.info("deliver_to_code: starting post-delivery stable poll")
-    if _poll_until_stable(port, DELIVERY_STABLE_TIMEOUT, label="post-delivery"):
-        return True, "delivered (stable)"
-    return True, "delivered (status did not reach stable within timeout)"
-
-
-# ---------- Messages API ----------
+# ---------- Messages API (Chat side) ----------
 
 def load_template() -> str:
     try:
@@ -594,6 +235,60 @@ def call_chat(
         messages=[{"role": "user", "content": code_to_chat_content}],
     )
     return _extract_text(resp.content)
+
+
+# ---------- Code-side delivery (Agent SDK) ----------
+
+def deliver_to_code(project_path: Path, chat_to_code_content: str, state: "State") -> None:
+    """Hand the approved CHAT_TO_CODE.md to Claude Code via the Agent SDK.
+
+    Fire-and-forget: spawns a daemon thread that runs the SDK `query()` async
+    iterator to completion. State transitions are:
+      'awaiting_approval' -> 'delivering' (set by /approve before calling here)
+                          -> 'executing'  (set by the worker as soon as it starts)
+                          -> 'watching'   (success, drained all messages)
+                          -> 'error'      (any exception during the SDK call)
+
+    Each delivery is a fresh Claude Code session — CHAT_TO_CODE.md carries
+    all the context Code needs, and the project's CLAUDE.md is loaded via
+    setting_sources=["project"]. The watchdog keeps watching the project
+    directory while Code runs; if Code writes CODE_TO_CHAT.md mid-execution,
+    the next loop iteration starts automatically.
+
+    permission_mode="bypassPermissions" mirrors the prior --dangerously-skip-
+    permissions intent: User has already approved the brief at /decision, so
+    per-tool prompts during execution would just re-litigate that decision.
+    """
+    # Import inside the function so .env is loaded before the SDK first sees
+    # ANTHROPIC_API_KEY at import time (per WATCH FOR in the brief).
+    from claude_agent_sdk import ClaudeAgentOptions, query
+
+    def _run() -> None:
+        state.set_status("executing")
+        state.log("Delivering to Code via Agent SDK")
+        try:
+            options = ClaudeAgentOptions(
+                cwd=str(project_path),
+                setting_sources=["project"],
+                permission_mode="bypassPermissions",
+            )
+
+            async def _consume() -> None:
+                # query() is async; we drain the iterator to drive it to
+                # completion. v1 is fire-and-forget — no streaming UI — so
+                # we don't surface individual messages.
+                async for _msg in query(prompt=chat_to_code_content, options=options):
+                    pass
+
+            asyncio.run(_consume())
+            state.set_status("watching")
+            state.log("Code execution complete — watching for CODE_TO_CHAT.md")
+        except Exception as exc:
+            logging.exception("Agent SDK delivery failed")
+            state.set_status("error")
+            state.log(f"Agent SDK error: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, daemon=True, name="sdk-delivery").start()
 
 
 # ---------- watchdog handler ----------
@@ -704,21 +399,15 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
         if snap["status"] != "awaiting_approval":
             return redirect(url_for("index"))
         state.set_status("delivering")
-        state.log("User approved — delivering to Code")
-        message = (
-            f"CHAT_TO_CODE.md has been approved. Read the file at "
-            f"{state.project_path / CHAT_TO_CODE} and execute it per "
-            f"/project:mode-cc instructions."
-        )
-        ok, msg = deliver_to_code(content=message, port=state.agentapi_port, state=state)
-        if not ok:
-            state.set_status("error")
-            state.log(f"Delivery failed: {msg}")
-        else:
-            with state._lock:
-                state.pending_decision = ""
-            state.set_status("watching")
-            state.log(f"Delivered to Code ({msg})")
+        state.log("User approved — handing off to Agent SDK")
+        # Fire-and-forget: deliver_to_code spawns a daemon thread and
+        # returns immediately. Status will transition to 'executing' inside
+        # the thread, then to 'watching' or 'error' when the SDK call
+        # completes. The browser sees these transitions on auto-refresh.
+        decision_content = state.pending_decision
+        with state._lock:
+            state.pending_decision = ""
+        deliver_to_code(state.project_path, decision_content, state)
         return redirect(url_for("index"))
 
     @app.route("/reject", methods=["POST"])
@@ -784,13 +473,11 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    parser = argparse.ArgumentParser(description="claude-mode middleware (Phase 3)")
+    parser = argparse.ArgumentParser(description="claude-mode middleware (Phase 3, Agent SDK)")
     parser.add_argument("--project", required=True,
                         help="Path to the Claude Code project directory to watch")
     parser.add_argument("--port", type=int, default=DEFAULT_FLASK_PORT,
                         help="Flask web UI port (default 5000; falls back to 5001/5002)")
-    parser.add_argument("--agentapi-port", type=int, default=DEFAULT_AGENTAPI_PORT,
-                        help="Port AgentAPI is expected to listen on (default 3284)")
     args = parser.parse_args()
 
     # validate project path
@@ -798,7 +485,10 @@ def main() -> int:
     if not project_path.is_dir():
         fatal(f"--project path does not exist or is not a directory: {project_path}")
 
-    # load .env from middleware/.env
+    # Load .env BEFORE the Agent SDK is touched anywhere — the SDK reads
+    # ANTHROPIC_API_KEY at import time in deliver_to_code(), so the env must
+    # be populated first. This also covers the Anthropic Messages API client
+    # used on the Chat side.
     load_dotenv(MIDDLEWARE_DIR / ENV_FILENAME)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         fatal(
@@ -806,15 +496,7 @@ def main() -> int:
             f"{MIDDLEWARE_DIR / ENV_FILENAME} as: ANTHROPIC_API_KEY=sk-ant-..."
         )
 
-    # check agentapi
-    if find_agentapi() is None:
-        fatal(
-            "agentapi binary not found on PATH. "
-            "Install it from https://github.com/coder/agentapi/releases "
-            "(or `npm i -g agentapi`) and ensure it is on PATH."
-        )
-
-    # flask port (with fallback)
+    # Flask port (with fallback)
     flask_port = find_free_port(args.port, tries=FLASK_PORT_TRIES)
     if flask_port is None:
         fatal(
@@ -824,41 +506,20 @@ def main() -> int:
     if flask_port != args.port:
         logging.info("Flask fell back from port %s to %s", args.port, flask_port)
 
-    # agentapi port — if a stale AgentAPI (or any other listener) is holding
-    # it, kill it automatically so the next startup is not blocked. fatal()
-    # is raised inside the helper if the PID cannot be identified or killed.
-    free_port_or_kill_stale(args.agentapi_port)
-
-    state = State(
-        project_path=project_path,
-        flask_port=flask_port,
-        agentapi_port=args.agentapi_port,
-    )
+    state = State(project_path=project_path, flask_port=flask_port)
     template = load_template()
 
-    # launch agentapi
-    state.log("Launching AgentAPI subprocess")
-    launch_agentapi()
-
-    # wait for ready
-    state.log(f"Waiting for AgentAPI at http://127.0.0.1:{args.agentapi_port}/status")
-    if not wait_for_agentapi(args.agentapi_port):
-        terminate_agentapi()
-        fatal(f"AgentAPI did not become ready within {AGENTAPI_READY_TIMEOUT}s")
-    state.agentapi_running = True
-    state.log("AgentAPI is ready")
-
-    # anthropic client (reads ANTHROPIC_API_KEY from env)
+    # Anthropic client for the Chat side (Messages API)
     client = Anthropic()
 
-    # watchdog
+    # Watchdog
     handler = HandoffHandler(state=state, client=client, template=template)
     observer = Observer()
     observer.schedule(handler, str(project_path), recursive=False)
     observer.start()
     state.log(f"Watching {project_path} for {CODE_TO_CHAT}")
 
-    # flask in a daemon thread
+    # Flask in a daemon thread
     app = build_flask_app(state, client, template)
 
     def run_flask():
@@ -869,17 +530,16 @@ def main() -> int:
     flask_thread.start()
     state.set_status("watching")
 
-    # banner
+    # Banner
     print()
-    print("claude-mode middleware running")
+    print("claude-mode middleware running (Agent SDK)")
     print(f"Watching:   {project_path}")
     print(f"Web UI:     http://127.0.0.1:{flask_port}")
-    print(f"AgentAPI:   http://127.0.0.1:{args.agentapi_port}")
     print()
     print("Press Ctrl+C to stop.")
     print()
 
-    # shutdown coordination
+    # Shutdown coordination
     shutdown_event = threading.Event()
 
     def handle_signal(signum, frame):
@@ -912,7 +572,9 @@ def main() -> int:
             observer.join(timeout=5)
         except Exception:
             pass
-        terminate_agentapi()
+        # Note: any in-flight Agent SDK delivery thread is a daemon and will
+        # be killed when the main process exits. This is acceptable per v1
+        # design — User can re-approve from /decision if a delivery was lost.
         logging.info("Shutdown complete")
 
     return 0

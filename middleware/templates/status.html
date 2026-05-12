@@ -14,6 +14,7 @@
       --ok: #2a7a2a;
       --warn: #b06a00;
       --bad: #a02020;
+      --busy: #2050b0;
     }
     @media (prefers-color-scheme: dark) {
       :root { --fg:#e6e6e6; --bg:#1a1a1a; --muted:#9a9a9a; --border:#3a3a3a; }
@@ -26,6 +27,7 @@
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
+    .busy { color: var(--busy); }
     ul.log { list-style: none; padding: 0; margin: 0; }
     ul.log li { padding: 0.25rem 0; border-bottom: 1px dotted var(--border); }
     ul.log li:last-child { border-bottom: 0; }
@@ -37,9 +39,8 @@
   <h1>CLAUDE-MODE MIDDLEWARE</h1>
 
   <div class="card">
-    <div class="field"><b>Status</b><span class="{% if state.status == 'watching' %}ok{% elif state.status == 'awaiting_approval' %}warn{% else %}ok{% endif %}">{{ state.status }}</span></div>
+    <div class="field"><b>Status</b><span class="{% if state.status == 'watching' %}ok{% elif state.status == 'executing' or state.status == 'delivering' or state.status == 'processing' %}busy{% elif state.status == 'awaiting_approval' %}warn{% elif state.status == 'error' %}bad{% else %}ok{% endif %}">{% if state.status == 'executing' %}executing (Code is running…){% else %}{{ state.status }}{% endif %}</span></div>
     <div class="field"><b>Project</b><span>{{ state.project_path }}</span></div>
-    <div class="field"><b>AgentAPI</b><span class="{% if state.agentapi_running %}ok{% else %}bad{% endif %}">{% if state.agentapi_running %}running (port {{ state.agentapi_port }}){% else %}stopped{% endif %}</span></div>
     <div class="field"><b>Web UI</b><span>http://localhost:{{ state.flask_port }}</span></div>
     <div class="field"><b>Last event</b><span>{{ state.last_event or '—' }}</span></div>
   </div>
