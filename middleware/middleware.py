@@ -239,7 +239,7 @@ def call_chat(
 
 # ---------- Code-side delivery (Agent SDK) ----------
 
-def deliver_to_code(project_path: Path, chat_to_code_content: str, state: "State") -> None:
+def deliver_to_code(project_path: Path, state: "State") -> None:
     """Hand the approved CHAT_TO_CODE.md to Claude Code via the Agent SDK.
 
     Fire-and-forget: spawns a daemon thread that runs the SDK `query()` async
@@ -248,6 +248,15 @@ def deliver_to_code(project_path: Path, chat_to_code_content: str, state: "State
                           -> 'executing'  (set by the worker as soon as it starts)
                           -> 'watching'   (success, drained all messages)
                           -> 'error'      (any exception during the SDK call)
+
+    The prompt is a short, unambiguous instruction telling Code to read
+    CHAT_TO_CODE.md from the project directory and execute it. The brief
+    file is already on disk by this point — written by the watchdog handler
+    when Chat's response came back, well before User saw /decision. Passing
+    the file content as the prompt would be incoherent: the brief opens with
+    "Read this file. Follow the NEXT ACTION." which has no referent when the
+    content IS the message. Pointing at the file from disk preserves the
+    intended file-based mode-cc workflow.
 
     Each delivery is a fresh Claude Code session — CHAT_TO_CODE.md carries
     all the context Code needs, and the project's CLAUDE.md is loaded via
@@ -260,8 +269,14 @@ def deliver_to_code(project_path: Path, chat_to_code_content: str, state: "State
     per-tool prompts during execution would just re-litigate that decision.
     """
     # Import inside the function so .env is loaded before the SDK first sees
-    # ANTHROPIC_API_KEY at import time (per WATCH FOR in the brief).
+    # ANTHROPIC_API_KEY at import time (per WATCH FOR in the prior brief).
     from claude_agent_sdk import ClaudeAgentOptions, query
+
+    prompt = (
+        f"Read the file {CHAT_TO_CODE} in the current project directory "
+        "and execute the instructions in the NEXT ACTION section exactly "
+        "as written. The file contains a complete session brief."
+    )
 
     def _run() -> None:
         state.set_status("executing")
@@ -277,7 +292,7 @@ def deliver_to_code(project_path: Path, chat_to_code_content: str, state: "State
                 # query() is async; we drain the iterator to drive it to
                 # completion. v1 is fire-and-forget — no streaming UI — so
                 # we don't surface individual messages.
-                async for _msg in query(prompt=chat_to_code_content, options=options):
+                async for _msg in query(prompt=prompt, options=options):
                     pass
 
             asyncio.run(_consume())
@@ -404,10 +419,12 @@ def build_flask_app(state: State, client: Anthropic, template: str) -> Flask:
         # returns immediately. Status will transition to 'executing' inside
         # the thread, then to 'watching' or 'error' when the SDK call
         # completes. The browser sees these transitions on auto-refresh.
-        decision_content = state.pending_decision
+        # The brief content does not need to be passed — it is already
+        # written to CHAT_TO_CODE.md in the project directory by the
+        # watchdog handler, and Code reads it from disk per the SDK prompt.
         with state._lock:
             state.pending_decision = ""
-        deliver_to_code(state.project_path, decision_content, state)
+        deliver_to_code(state.project_path, state)
         return redirect(url_for("index"))
 
     @app.route("/reject", methods=["POST"])
