@@ -302,16 +302,42 @@ def deliver_to_code(project_path: Path, state: "State") -> None:
                     pass
 
             asyncio.run(_consume())
+            # State-clobber guard: only transition back to 'watching' if the
+            # system is still in 'executing'. If a Flow A event fired during
+            # the SDK call (Code wrote CODE_TO_CHAT.md mid-execution, the
+            # core multi-iteration use case) the handler will have moved
+            # state to 'processing' -> 'awaiting_approval' while we ran.
+            # Overriding that here would silently drop the new pending
+            # decision from the status page even though pending_decision
+            # is preserved in State. Lock-protected check + transition so
+            # the read and write are atomic against the other flow's lock.
             with state._lock:
-                state.pending_flow = None
-            state.set_status("watching")
-            state.log(
-                f"Code execution complete — watching for {CODE_TO_CHAT} or {CHAT_TO_CODE}"
-            )
+                if state.status == "executing":
+                    state.pending_flow = None
+                    state.status = "watching"
+                    finalized = True
+                    terminal_status = "watching"
+                else:
+                    finalized = False
+                    terminal_status = state.status
+            if finalized:
+                state.log(
+                    f"Code execution complete — watching for {CODE_TO_CHAT} or {CHAT_TO_CODE}"
+                )
+            else:
+                state.log(
+                    f"Code execution complete — leaving state as {terminal_status!r} "
+                    "(another flow took over during execution)"
+                )
         except Exception as exc:
             logging.exception("Agent SDK delivery failed")
             # pending_flow intentionally retained on error so the status page
             # still shows which flow was being executed when it failed.
+            # The same state-clobber race exists on this error path — if
+            # Flow A fired and moved state to 'awaiting_approval' during
+            # the SDK call, this set_status('error') will override that.
+            # Out of scope for this commit (User asked specifically for
+            # the success-path guard); flag for a future fix if it bites.
             state.set_status("error")
             state.log(f"Agent SDK error: {type(exc).__name__}: {exc}")
 
