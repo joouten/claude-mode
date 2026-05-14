@@ -336,14 +336,24 @@ class HandoffHandler(FileSystemEventHandler):
       filename only cancel/reset that filename's timer — concurrent events
       for the two files do not interfere with each other.
 
-    Flow B suppression rule
-      Flow B fires only when state.status == 'watching'. This is critical
-      because Flow A writes CHAT_TO_CODE.md to disk as part of its work,
-      which would otherwise re-trigger the watchdog and start a recursive
-      Flow B for the brief we just generated. Other transient states
-      (processing, awaiting_approval, delivering, executing, error) likewise
-      block Flow B — the system is busy with something else, the User can
-      retrigger by re-saving once back to 'watching'.
+    Suppression asymmetry
+      Flow A and Flow B have intentionally DIFFERENT state guards. Do not
+      symmetrize them.
+
+      Flow A — NO state guard. Runs from any state, including 'executing'.
+        Code writing CODE_TO_CHAT.md mid-execution is the core multi-
+        iteration use case: the SDK delivery from a prior approval is
+        still running, Code hits another decision point and writes
+        CODE_TO_CHAT.md, the watchdog catches it, Flow A processes it
+        immediately. Without this, the loop stops at the first turn.
+
+      Flow B — 'watching' only. Runs only when the system is idle. This
+        guards against three legitimate self-writes that would otherwise
+        re-trigger as bogus Flow B sessions:
+          1. Flow A writes CHAT_TO_CODE.md after Chat responds.
+          2. /reject revise writes a revised CHAT_TO_CODE.md.
+          3. Code may edit CHAT_TO_CODE.md during execution.
+        None of those represent a User-initiated new session.
     """
 
     TARGET_FILES = (CODE_TO_CHAT, CHAT_TO_CODE)
@@ -395,16 +405,33 @@ class HandoffHandler(FileSystemEventHandler):
             self._schedule_handoff(event.src_path)
 
     def _process(self, src_path: str) -> None:
+        """Dispatch a debounced watchdog event to the appropriate flow.
+
+        Suppression asymmetry (READ BEFORE MODIFYING):
+
+          Flow A (CODE_TO_CHAT.md) — runs from ANY state including
+            'executing'. This is the core multi-iteration use case:
+            Code writing CODE_TO_CHAT.md mid-execution must immediately
+            trigger the next iteration. NEVER add a state check here.
+
+          Flow B (CHAT_TO_CODE.md) — runs ONLY from 'watching'. This
+            guards against three legitimate self-writes that would
+            otherwise re-trigger as bogus Flow B sessions:
+              1. Flow A writes CHAT_TO_CODE.md after Chat responds.
+              2. /reject revise writes a revised CHAT_TO_CODE.md.
+              3. Code may edit CHAT_TO_CODE.md during execution.
+            None of those should re-enter the loop as Flow B.
+        """
         filename = Path(src_path).name
         try:
             if filename == CODE_TO_CHAT:
+                # Flow A: INTENTIONALLY unguarded — see docstring above.
+                # Do NOT add `if self.state.snapshot()["status"] != ...` here.
+                # Code writing CODE_TO_CHAT.md while a delivery is still
+                # 'executing' is the central multi-iteration feature.
                 self._process_flow_a(src_path)
             elif filename == CHAT_TO_CODE:
-                # Flow B suppression: only treat as a Chat-initiated session
-                # when the system is idle. Otherwise this event is most
-                # likely the file we just wrote ourselves (Flow A processing,
-                # /reject revise, etc.) or a User edit while a prior brief
-                # is still pending.
+                # Flow B: guarded against self-writes (see docstring).
                 current = self.state.snapshot()["status"]
                 if current != "watching":
                     logging.info(
