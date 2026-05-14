@@ -84,7 +84,7 @@ Startup is near-instant — there is no subprocess to launch and no port to wait
 | `POST /approve` | Hands the approved brief to Claude Code via the Agent SDK in a fire-and-forget daemon thread, then immediately returns to the status page. The status page transitions through `delivering → executing → watching` (or `error`) on auto-refresh. |
 | `POST /reject` | Sends User's feedback back to the Messages API, gets a revised brief, returns to the decision page. |
 
-The decision page opens automatically in the default browser when a new `CODE_TO_CHAT.md` is detected. If the browser fails to open (headless environments, etc.) the URL is logged so it can be opened manually.
+Middleware does not open the browser for you. Keep the status page (`http://localhost:5000/`) open — it auto-refreshes every 3 seconds, so the `awaiting_approval` status (and the inline "Review now →" card) appears within seconds of a new brief being ready.
 
 ### Status values
 
@@ -122,7 +122,6 @@ The decision page opens automatically in the default browser when a new `CODE_TO
 
 - **`ANTHROPIC_API_KEY not set`** — create `middleware/.env` with the key. Don't `export` it from your shell — middleware specifically loads from the file so the configuration is reproducible.
 - **`Agent SDK error: CLINotFoundError`** — the SDK couldn't find the `claude` CLI on PATH. Install Claude Code and verify `where claude` (Windows) / `which claude` (Unix) returns a path.
-- **Browser doesn't open on decision** — the URL is logged. Open `http://127.0.0.1:5000/decision` manually.
 - **Status stuck at `executing` for a long time** — Code is running. The status flips to `watching` (success) or `error` when the SDK call returns. If it never returns, check the middleware terminal for tracebacks.
 
 ## History

@@ -27,7 +27,6 @@ import socket
 import sys
 import threading
 import time
-import webbrowser
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -488,7 +487,6 @@ class HandoffHandler(FileSystemEventHandler):
             self.state.pending_flow = "A"
         self.state.set_status("awaiting_approval")
         self.state.log(f"Decision written to {CHAT_TO_CODE} — awaiting User approval (Flow A)")
-        self._open_decision_browser()
 
     def _process_flow_b(self, src_path: str) -> None:
         """Flow B: Chat-initiated session. CHAT_TO_CODE.md was written
@@ -502,15 +500,6 @@ class HandoffHandler(FileSystemEventHandler):
             self.state.pending_flow = "B"
         self.state.set_status("awaiting_approval")
         self.state.log(f"Brief loaded from {CHAT_TO_CODE} — awaiting User approval (Flow B)")
-        self._open_decision_browser()
-
-    def _open_decision_browser(self) -> None:
-        try:
-            opened = webbrowser.open(f"http://127.0.0.1:{self.state.flask_port}/decision")
-            if not opened:
-                self.state.log("webbrowser.open returned False — open the URL manually")
-        except Exception as exc:
-            self.state.log(f"webbrowser.open failed: {exc}")
 
 
 # ---------- Flask app ----------
